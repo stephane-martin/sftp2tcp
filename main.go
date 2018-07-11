@@ -23,6 +23,9 @@ import (
 	cli "gopkg.in/urfave/cli.v1"
 )
 
+var Version string
+var GitCommit string
+
 func getLogger(level string, toSyslog bool) log15.Logger {
 	lvl, _ := log15.LvlFromString(level)
 	logger := log15.New()
@@ -62,6 +65,7 @@ func makeApp() *cli.App {
 	}
 	app.Copyright = "Apache 2 licence"
 	app.Usage = "Proxy files received by SFTP to a TCP service"
+	app.Version = Version
 
 	app.Flags = []cli.Flag{
 		cli.StringFlag{
