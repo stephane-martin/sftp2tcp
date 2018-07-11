@@ -33,9 +33,15 @@
   ]
   revision = "a49355c7e3f8fe157a85be2f77e6e269a0f89602"
 
+[[projects]]
+  name = "gopkg.in/urfave/cli.v1"
+  packages = ["."]
+  revision = "cfb38830724cc34fedffe9a2a29fb54fa9169cd1"
+  version = "v1.20.0"
+
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "0103a3f799a0f3fee8c83dbf69b662f050db250348481391c251118bd2e05e98"
+  inputs-digest = "f09828b5ff6945ec81b2e4a6dec8c3f166a089f6245688655c64a1e097283b80"
   solver-name = "gps-cdcl"
   solver-version = 1
