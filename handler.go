@@ -16,7 +16,7 @@ import (
 	"github.com/pkg/sftp"
 )
 
-// In memory file-system-y thing that the Hanlders live on
+// In memory pseudo file-system thing
 type root struct {
 	*memFile
 	destination *tcpDestination
@@ -26,12 +26,12 @@ type root struct {
 	mockErr     error
 }
 
-func newRoot(destination *tcpDestination, logger log15.Logger) *root {
+func newRoot(dest *tcpDestination, l log15.Logger) *root {
 	r := &root{
 		files:       make(map[string]*memFile),
-		memFile:     newMemFile("/", true, destination, logger),
-		destination: destination,
-		logger:      logger,
+		memFile:     newMemFile("/", true, dest, l),
+		destination: dest,
+		logger:      l,
 	}
 	return r
 }
@@ -53,8 +53,8 @@ func (fs *root) fetch(path string) (*memFile, error) {
 }
 
 // SFTP2TCPHandler returns... TODO
-func SFTP2TCPHandler(destination *tcpDestination, logger log15.Logger) sftp.Handlers {
-	r := newRoot(destination, logger)
+func SFTP2TCPHandler(dest *tcpDestination, l log15.Logger) sftp.Handlers {
+	r := newRoot(dest, l)
 	return sftp.Handlers{
 		FileCmd:  r,
 		FileGet:  r,
@@ -227,6 +227,7 @@ type memFile struct {
 	destination *tcpDestination
 	logger      log15.Logger
 	position    int64
+	err         error
 	*sync.Mutex
 	*sync.Cond
 }
@@ -280,33 +281,37 @@ func (f *memFile) WriterAt() (io.WriterAt, error) {
 }
 func (f *memFile) WriteAt(p []byte, off int64) (int, error) {
 	f.Lock()
+	defer f.Unlock()
 	for f.position != off {
 		f.Wait()
 	}
 	f.logger.Debug("WriteAt", "name", f.name, "length", len(p), "offset", off)
+	if f.err != nil {
+		return 0, f.err
+	}
 	if f.conn == nil {
 		var err error
 		f.conn, err = f.destination.getConn()
 		if err != nil {
 			f.logger.Error("Failed to make connection to TCP destination", "remote", f.destination.hostport, "error", err)
+			f.err = err
 			return 0, err
 		}
 	}
 	n, err := f.conn.Write(p)
 	if err != nil {
 		f.logger.Error("Error happened writing to TCP destination", "error", err)
+		f.err = err
 	}
 	f.position += int64(n)
 	f.Broadcast()
-	f.Unlock()
 	return n, err
 }
 
 func (f *memFile) Close() error {
-	if f.conn == nil {
-		return nil
-	}
-	return f.conn.Close()
+	f.Lock()
+	defer f.Unlock()
+	return f.destination.releaseConn(f.conn)
 }
 
 func fakeFileInfoSys() interface{} {
