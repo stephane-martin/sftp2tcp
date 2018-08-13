@@ -35,7 +35,7 @@
   branch = "master"
   name = "github.com/mitchellh/go-homedir"
   packages = ["."]
-  revision = "3864e76763d94a6df2f9960b16a20a33da9f9a66"
+  revision = "58046073cbffe2f25d425fe1331102f55cf719de"
 
 [[projects]]
   name = "github.com/pkg/errors"
@@ -46,8 +46,8 @@
 [[projects]]
   name = "github.com/pkg/sftp"
   packages = ["."]
-  revision = "57673e38ea946592a59c26592b7e6fbda646975b"
-  version = "1.8.0"
+  revision = "6b9fa10dea25176501bd80eb8a45a46d2afc97ad"
+  version = "v1.8.1"
 
 [[projects]]
   branch = "master"
@@ -61,13 +61,13 @@
     "poly1305",
     "ssh"
   ]
-  revision = "a49355c7e3f8fe157a85be2f77e6e269a0f89602"
+  revision = "de0752318171da717af4ce24d0a2e8626afaeb11"
 
 [[projects]]
   branch = "master"
   name = "golang.org/x/net"
   packages = ["context"]
-  revision = "039a4258aec0ad3c79b905677cceeab13b296a77"
+  revision = "c39426892332e1bb5ec0a434a079bf82f5d30c54"
 
 [[projects]]
   branch = "master"
@@ -79,7 +79,7 @@
   branch = "master"
   name = "golang.org/x/sys"
   packages = ["unix"]
-  revision = "1b2967e3c290b7c545b3db0deeda16e9be4f98a2"
+  revision = "98c5dad5d1a0e8a73845ecc8897d0bd56586511d"
 
 [[projects]]
   name = "gopkg.in/urfave/cli.v1"
@@ -90,6 +90,6 @@
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "010b5c8a6c00913350e210a7109b162518abd6e3fed5f664dbb673cdee180b77"
+  inputs-digest = "7c902effea57b838423b2696e3609b5104cd01e584ede983e91408cb184bacab"
   solver-name = "gps-cdcl"
   solver-version = 1
