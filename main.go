@@ -135,6 +135,12 @@ func makeApp() *cli.App {
 			Usage:  "Maximum number of concurrent file uploads",
 			EnvVar: "SFTP2TCP_MAXUPLOADS",
 		},
+		cli.Uint64Flag{
+			Name:   "maxuploadrate",
+			Value:  0,
+			Usage:  "Maximum upload rate per upload, in megabits/sec (0 for unlimited)",
+			EnvVar: "SFTP2TCP_MAXRATE",
+		},
 	}
 
 	app.Commands = []cli.Command{
@@ -196,6 +202,7 @@ func proxy(c *cli.Context) (err error) {
 	toSyslog := c.GlobalBool("syslog")
 	maxUploads := c.GlobalUint("maxuploads")
 	maxInputConns := c.GlobalUint("maxinputconns")
+	rate := c.GlobalUint64("maxuploadrate")
 
 	if len(host) == 0 {
 		return exitError("Empty destination host", nil)
@@ -292,12 +299,12 @@ func proxy(c *cli.Context) (err error) {
 		cancel()
 	}()
 
-	acceptLoop(lctx, g, listener, config, desthostport, maxInputConns, maxUploads, logger)
+	acceptLoop(lctx, g, listener, config, desthostport, maxInputConns, maxUploads, rate, logger)
 	_ = g.Wait()
 	return nil
 }
 
-func acceptLoop(ctx context.Context, g *errgroup.Group, listener net.Listener, cfg *ssh.ServerConfig, desthostport string, maxConns uint, maxUps uint, l log15.Logger) {
+func acceptLoop(ctx context.Context, g *errgroup.Group, listener net.Listener, cfg *ssh.ServerConfig, desthostport string, maxConns uint, maxUps uint, r uint64, l log15.Logger) {
 	conns := make(chan struct{}, maxConns)
 	for {
 		select {
@@ -308,6 +315,7 @@ func acceptLoop(ctx context.Context, g *errgroup.Group, listener net.Listener, c
 		conn, err := listener.Accept()
 		if err != nil {
 			l.Debug("Close Accept()", "error", err)
+			<-conns
 			return
 		}
 		go func() {
@@ -315,7 +323,7 @@ func acceptLoop(ctx context.Context, g *errgroup.Group, listener net.Listener, c
 			conn.Close()
 		}()
 		g.Go(func() error {
-			err := handleConnection(ctx, g, conn, cfg, desthostport, maxUps, l)
+			err := handleConnection(ctx, g, conn, cfg, desthostport, maxUps, r, l)
 			if err != nil {
 				l.Warn("Handle connection error", "error", err)
 			}
@@ -325,7 +333,7 @@ func acceptLoop(ctx context.Context, g *errgroup.Group, listener net.Listener, c
 	}
 }
 
-func handleConnection(ctx context.Context, g *errgroup.Group, nConn net.Conn, config *ssh.ServerConfig, desthostport string, maxUps uint, logger log15.Logger) error {
+func handleConnection(ctx context.Context, g *errgroup.Group, nConn net.Conn, config *ssh.ServerConfig, desthostport string, maxUps uint, r uint64, logger log15.Logger) error {
 	logger.Debug("Handle connection", "remote", nConn.RemoteAddr())
 	lctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -335,9 +343,9 @@ func handleConnection(ctx context.Context, g *errgroup.Group, nConn net.Conn, co
 		return fmt.Errorf("Handshake failed: %s", err)
 	}
 	logger.Debug("Handshake done")
-	defer func() {
+	go func() {
+		<-lctx.Done()
 		sconn.Close()
-		nConn.Close()
 	}()
 
 	// The incoming Request channel must be serviced.
@@ -383,6 +391,11 @@ IncomingChannel:
 				return fmt.Errorf("Could not accept channel: %s", err)
 			}
 			logger.Debug("Channel accepted")
+			go func() {
+				<-lctx.Done()
+				logger.Debug("Channel closed")
+				channel.Close()
+			}()
 
 			// Sessions have out-of-band requests such as "shell",
 			// "pty-req" and "env".  Here we handle only the
@@ -410,24 +423,29 @@ IncomingChannel:
 					}
 				}
 			})
-
-			root := SFTP2TCPHandler(
-				newDestination(lctx.Done(), desthostport, maxUps),
-				logger,
-			)
+			dest := newDestination(lctx.Done(), desthostport, maxUps, logger)
+			root := SFTP2TCPHandler(dest, r, lctx.Done(), logger)
 			server := sftp.NewRequestServer(channel, root)
+			errServeChan := make(chan error, 2)
 			go func() {
 				// close the server when the context is canceled
 				// makes server.Serve() return
 				<-lctx.Done()
+				logger.Debug("server.Close() called")
 				server.Close()
+				errServeChan <- context.Canceled
 			}()
-			err = server.Serve()
-			if err == io.EOF {
+			go func() {
+				logger.Debug("Serve()")
+				errServeChan <- server.Serve()
+			}()
+			errServe := <-errServeChan
+			logger.Debug("Serve() returned")
+			if errServe == io.EOF {
 				server.Close()
 				logger.Info("SFTP client has left")
-			} else if err != nil {
-				logger.Warn("SFTP serve completed", "error", err)
+			} else if errServe != nil {
+				logger.Warn("SFTP serve completed with error", "error", errServe)
 			} else {
 				logger.Info("SFTP serve completed without error")
 			}

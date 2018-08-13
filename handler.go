@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -23,14 +24,18 @@ type root struct {
 	logger      log15.Logger
 	files       map[string]*memFile
 	filesLock   sync.Mutex
+	uploadRate  uint64
 	mockErr     error
+	done        <-chan struct{}
 }
 
-func newRoot(dest *tcpDestination, l log15.Logger) *root {
+func newRoot(dest *tcpDestination, rate uint64, done <-chan struct{}, l log15.Logger) *root {
 	r := &root{
 		files:       make(map[string]*memFile),
-		memFile:     newMemFile("/", true, dest, l),
+		memFile:     newMemFile("/", true, dest, rate, done, l),
 		destination: dest,
+		uploadRate:  rate,
+		done:        done,
 		logger:      l,
 	}
 	return r
@@ -53,8 +58,8 @@ func (fs *root) fetch(path string) (*memFile, error) {
 }
 
 // SFTP2TCPHandler returns... TODO
-func SFTP2TCPHandler(dest *tcpDestination, l log15.Logger) sftp.Handlers {
-	r := newRoot(dest, l)
+func SFTP2TCPHandler(dest *tcpDestination, rate uint64, done <-chan struct{}, l log15.Logger) sftp.Handlers {
+	r := newRoot(dest, rate, done, l)
 	return sftp.Handlers{
 		FileCmd:  r,
 		FileGet:  r,
@@ -109,7 +114,7 @@ func (fs *root) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	if !dir.isdir {
 		return nil, os.ErrInvalid
 	}
-	file := newMemFile(r.Filepath, false, fs.destination, fs.logger)
+	file := newMemFile(r.Filepath, false, fs.destination, fs.uploadRate, fs.done, fs.logger)
 	return file.WriterAt()
 }
 
@@ -144,13 +149,13 @@ func (fs *root) Filecmd(r *sftp.Request) error {
 		if err != nil {
 			return err
 		}
-		fs.files[r.Filepath] = newMemFile(r.Filepath, true, fs.destination, fs.logger)
+		fs.files[r.Filepath] = newMemFile(r.Filepath, true, fs.destination, fs.uploadRate, fs.done, fs.logger)
 	case "Symlink":
 		_, err := fs.fetch(r.Filepath)
 		if err != nil {
 			return err
 		}
-		link := newMemFile(r.Target, false, fs.destination, fs.logger)
+		link := newMemFile(r.Target, false, fs.destination, fs.uploadRate, fs.done, fs.logger)
 		link.symlink = r.Filepath
 		fs.files[r.Target] = link
 	}
@@ -227,19 +232,25 @@ type memFile struct {
 	destination *tcpDestination
 	logger      log15.Logger
 	position    int64
+	maxrate     uint64
+	startTime   time.Time
+	done        <-chan struct{}
 	err         error
 	*sync.Mutex
 	*sync.Cond
 }
 
 // factory to make sure modtime is set
-func newMemFile(name string, isdir bool, destination *tcpDestination, logger log15.Logger) *memFile {
+func newMemFile(name string, isdir bool, destination *tcpDestination, maxrate uint64, done <-chan struct{}, logger log15.Logger) *memFile {
 	f := &memFile{
 		name:        name,
 		modtime:     time.Now(),
 		isdir:       isdir,
 		logger:      logger,
 		destination: destination,
+		startTime:   time.Now(),
+		maxrate:     maxrate,
+		done:        done,
 	}
 	f.Mutex = &sync.Mutex{}
 	f.Cond = sync.NewCond(f.Mutex)
@@ -296,6 +307,22 @@ func (f *memFile) WriteAt(p []byte, off int64) (int, error) {
 			f.logger.Error("Failed to make connection to TCP destination", "remote", f.destination.hostport, "error", err)
 			f.err = err
 			return 0, err
+		}
+	}
+	if f.maxrate > 0 {
+		currentPosition := float64(f.position * 8) // in bits
+		expectedDuration := time.Duration(int64(float64(time.Second) * (currentPosition / float64(f.maxrate*1024*1024))))
+		expectedTime := f.startTime.Add(expectedDuration)
+		now := time.Now()
+		if now.Before(expectedTime) {
+			wait := expectedTime.Sub(now)
+			f.logger.Debug("Wait for rate constraint", "duration", wait.Seconds())
+			select {
+			case <-f.done:
+				f.err = context.Canceled
+				return 0, context.Canceled
+			case <-time.After(wait):
+			}
 		}
 	}
 	n, err := f.conn.Write(p)
