@@ -68,6 +68,8 @@ func makeApp() *cli.App {
 	app.Version = Version
 
 	app.Flags = []cli.Flag{
+		// TODO: support multiple hosts for round-robin
+		// TODO: make an explicit DNS query
 		cli.StringFlag{
 			Name:   "desthost, d",
 			Value:  "127.0.0.1",
@@ -120,6 +122,18 @@ func makeApp() *cli.App {
 			Value:  "info",
 			Usage:  "logging level",
 			EnvVar: "SFTP2TCP_LOGLEVEL",
+		},
+		cli.UintFlag{
+			Name:   "maxinputconns",
+			Value:  12,
+			Usage:  "Maximum number of concurrent input connections",
+			EnvVar: "SFTP2TCP_MAXINPUTCONNS",
+		},
+		cli.UintFlag{
+			Name:   "maxuploads",
+			Value:  1,
+			Usage:  "Maximum number of concurrent file uploads",
+			EnvVar: "SFTP2TCP_MAXUPLOADS",
 		},
 	}
 
@@ -180,6 +194,8 @@ func proxy(c *cli.Context) (err error) {
 	privateKeyPath := strings.TrimSpace(c.GlobalString("privatekey"))
 	loglevel := strings.TrimSpace(c.GlobalString("loglevel"))
 	toSyslog := c.GlobalBool("syslog")
+	maxUploads := c.GlobalUint("maxuploads")
+	maxInputConns := c.GlobalUint("maxinputconns")
 
 	if len(host) == 0 {
 		return exitError("Empty destination host", nil)
@@ -276,16 +292,22 @@ func proxy(c *cli.Context) (err error) {
 		cancel()
 	}()
 
-	acceptLoop(lctx, g, listener, config, desthostport, logger)
+	acceptLoop(lctx, g, listener, config, desthostport, maxInputConns, maxUploads, logger)
 	_ = g.Wait()
 	return nil
 }
 
-func acceptLoop(ctx context.Context, g *errgroup.Group, listener net.Listener, config *ssh.ServerConfig, desthostport string, logger log15.Logger) {
+func acceptLoop(ctx context.Context, g *errgroup.Group, listener net.Listener, cfg *ssh.ServerConfig, desthostport string, maxConns uint, maxUps uint, l log15.Logger) {
+	conns := make(chan struct{}, maxConns)
 	for {
+		select {
+		case <-ctx.Done():
+			return
+		case conns <- struct{}{}:
+		}
 		conn, err := listener.Accept()
 		if err != nil {
-			logger.Debug("Close Accept()", "error", err)
+			l.Debug("Close Accept()", "error", err)
 			return
 		}
 		go func() {
@@ -293,16 +315,17 @@ func acceptLoop(ctx context.Context, g *errgroup.Group, listener net.Listener, c
 			conn.Close()
 		}()
 		g.Go(func() error {
-			err := handleConnection(ctx, g, conn, config, desthostport, logger)
+			err := handleConnection(ctx, g, conn, cfg, desthostport, maxUps, l)
 			if err != nil {
-				logger.Warn("Handle connection error", "error", err)
+				l.Warn("Handle connection error", "error", err)
 			}
+			<-conns
 			return nil
 		})
 	}
 }
 
-func handleConnection(ctx context.Context, g *errgroup.Group, nConn net.Conn, config *ssh.ServerConfig, desthostport string, logger log15.Logger) error {
+func handleConnection(ctx context.Context, g *errgroup.Group, nConn net.Conn, config *ssh.ServerConfig, desthostport string, maxUps uint, logger log15.Logger) error {
 	logger.Debug("Handle connection", "remote", nConn.RemoteAddr())
 	lctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -367,7 +390,7 @@ IncomingChannel:
 			g.Go(func() error {
 				for {
 					select {
-					case <-ctx.Done():
+					case <-lctx.Done():
 						return nil
 					case req, more := <-requests:
 						if !more {
@@ -388,7 +411,10 @@ IncomingChannel:
 				}
 			})
 
-			root := SFTP2TCPHandler(newDestination(desthostport), logger)
+			root := SFTP2TCPHandler(
+				newDestination(lctx.Done(), desthostport, maxUps),
+				logger,
+			)
 			server := sftp.NewRequestServer(channel, root)
 			go func() {
 				// close the server when the context is canceled
@@ -401,7 +427,9 @@ IncomingChannel:
 				server.Close()
 				logger.Info("SFTP client has left")
 			} else if err != nil {
-				logger.Info("SFTP server completed", "error", err)
+				logger.Warn("SFTP serve completed", "error", err)
+			} else {
+				logger.Info("SFTP serve completed without error")
 			}
 		}
 	}
