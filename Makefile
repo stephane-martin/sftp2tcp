@@ -7,7 +7,7 @@ SOURCES = $(shell find . -type f -name '*.go' -not -path "./vendor/*")
 BINARY=sftp2tcp
 FULL=github.com/stephane-martin/sftp2tcp
 COMMIT=$(shell git rev-parse HEAD)
-VERSION=0.2.0
+VERSION=0.2.2
 LDFLAGS=-ldflags '-X main.Version=${VERSION} -X main.GitCommit=${COMMIT}'
 LDFLAGS_RELEASE=-ldflags '-w -s -X main.Version=${VERSION} -X main.GitCommit=${COMMIT}'
 
