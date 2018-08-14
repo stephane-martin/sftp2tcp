@@ -12,10 +12,8 @@ LDFLAGS=-ldflags '-X main.Version=${VERSION} -X main.GitCommit=${COMMIT}'
 LDFLAGS_RELEASE=-ldflags '-w -s -X main.Version=${VERSION} -X main.GitCommit=${COMMIT}'
 
 $(BINARY): ${SOURCES} 
-	test -n "${GOPATH}"  # test $$GOPATH
-	go build -tags netgo -o ${BINARY} ${LDFLAGS} ${FULL}
+	go build -x -tags netgo -o ${BINARY}_debug ${LDFLAGS} ${FULL}
 
 release: ${SOURCES} 
-	test -n "${GOPATH}"  # test $$GOPATH
-	go build -tags netgo -o ${BINARY}_release -a -x ${LDFLAGS_RELEASE} ${FULL}
+	go build -a -installsuffix nocgo -tags netgo -o ${BINARY} ${LDFLAGS_RELEASE} ${FULL}
 
