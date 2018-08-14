@@ -76,7 +76,7 @@ func makeApp() *cli.App {
 			Usage:  "the destination host",
 			EnvVar: "SFTP2TCP_HOST",
 		},
-		cli.UintFlag{
+		cli.IntFlag{
 			Name:   "destport, p",
 			Value:  4444,
 			Usage:  "the destination port",
@@ -84,7 +84,7 @@ func makeApp() *cli.App {
 		},
 		cli.StringFlag{
 			Name:   "listenaddr, l",
-			Value:  "127.0.0.1",
+			Value:  "0.0.0.0",
 			Usage:  "the listen address for the SFTP service",
 			EnvVar: "SFTP2TCP_LISTENADDR",
 		},
@@ -192,7 +192,7 @@ func testTCPConnection(c *cli.Context) error {
 
 func proxy(c *cli.Context) (err error) {
 	host := strings.TrimSpace(c.GlobalString("desthost"))
-	port := c.GlobalUint("destport")
+	port := c.GlobalInt("destport")
 	listenaddr := strings.TrimSpace(c.GlobalString("listenaddr"))
 	listenport := c.GlobalUint("listenport")
 	username := strings.TrimSpace(c.GlobalString("username"))
@@ -207,11 +207,9 @@ func proxy(c *cli.Context) (err error) {
 	if len(host) == 0 {
 		return exitError("Empty destination host", nil)
 	}
-	if port == 0 {
-		return exitError("Destination port is 0", nil)
+	if port <= 0 {
+		return exitError("Destination port is 0 or negative", nil)
 	}
-
-	desthostport := fmt.Sprintf("%s:%d", host, port)
 
 	if len(listenaddr) == 0 {
 		return exitError("Empty listen address", nil)
@@ -299,12 +297,12 @@ func proxy(c *cli.Context) (err error) {
 		cancel()
 	}()
 
-	acceptLoop(lctx, g, listener, config, desthostport, maxInputConns, maxUploads, rate, logger)
+	acceptLoop(lctx, g, listener, config, host, port, maxInputConns, maxUploads, rate, logger)
 	_ = g.Wait()
 	return nil
 }
 
-func acceptLoop(ctx context.Context, g *errgroup.Group, listener net.Listener, cfg *ssh.ServerConfig, desthostport string, maxConns uint, maxUps uint, r uint64, l log15.Logger) {
+func acceptLoop(ctx context.Context, g *errgroup.Group, listener net.Listener, cfg *ssh.ServerConfig, dhost string, dport int, maxConns uint, maxUps uint, r uint64, l log15.Logger) {
 	conns := make(chan struct{}, maxConns)
 	for {
 		select {
@@ -323,7 +321,7 @@ func acceptLoop(ctx context.Context, g *errgroup.Group, listener net.Listener, c
 			conn.Close()
 		}()
 		g.Go(func() error {
-			err := handleConnection(ctx, g, conn, cfg, desthostport, maxUps, r, l)
+			err := handleConnection(ctx, g, conn, cfg, dhost, dport, maxUps, r, l)
 			if err != nil {
 				l.Warn("Handle connection error", "error", err)
 			}
@@ -333,7 +331,7 @@ func acceptLoop(ctx context.Context, g *errgroup.Group, listener net.Listener, c
 	}
 }
 
-func handleConnection(ctx context.Context, g *errgroup.Group, nConn net.Conn, config *ssh.ServerConfig, desthostport string, maxUps uint, r uint64, logger log15.Logger) error {
+func handleConnection(ctx context.Context, g *errgroup.Group, nConn net.Conn, config *ssh.ServerConfig, dhost string, dport int, maxUps uint, r uint64, logger log15.Logger) error {
 	logger.Debug("Handle connection", "remote", nConn.RemoteAddr())
 	lctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -423,7 +421,10 @@ IncomingChannel:
 					}
 				}
 			})
-			dest := newDestination(lctx.Done(), desthostport, maxUps, logger)
+			dest, err := newDestination(lctx.Done(), dhost, dport, maxUps, logger)
+			if err != nil {
+				return fmt.Errorf("Could not setup the destination: %s", err)
+			}
 			root := SFTP2TCPHandler(dest, r, lctx.Done(), logger)
 			server := sftp.NewRequestServer(channel, root)
 			errServeChan := make(chan error, 2)
@@ -436,6 +437,7 @@ IncomingChannel:
 				errServeChan <- context.Canceled
 			}()
 			go func() {
+				// TODO: that's only a workaround, there should be a way to make Serve() return cleanly
 				logger.Debug("Serve()")
 				errServeChan <- server.Serve()
 			}()

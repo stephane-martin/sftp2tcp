@@ -304,7 +304,7 @@ func (f *memFile) WriteAt(p []byte, off int64) (int, error) {
 		var err error
 		f.conn, err = f.destination.getConn()
 		if err != nil {
-			f.logger.Error("Failed to make connection to TCP destination", "remote", f.destination.hostport, "error", err)
+			f.logger.Error("Failed to make connection to TCP destination", "error", err)
 			f.err = err
 			return 0, err
 		}
