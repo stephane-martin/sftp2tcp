@@ -32,7 +32,7 @@ type root struct {
 func newRoot(dest *tcpDestination, rate uint64, done <-chan struct{}, l log15.Logger) *root {
 	r := &root{
 		files:       make(map[string]*memFile),
-		memFile:     newMemFile("/", true, dest, rate, done, l),
+		memFile:     newMemFile("/", true, dest, nil, rate, done, l),
 		destination: dest,
 		uploadRate:  rate,
 		done:        done,
@@ -114,7 +114,15 @@ func (fs *root) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	if !dir.isdir {
 		return nil, os.ErrInvalid
 	}
-	file := newMemFile(r.Filepath, false, fs.destination, fs.uploadRate, fs.done, fs.logger)
+
+	conn, err := fs.destination.getConn()
+	if err != nil {
+		c := cause(err)
+		fs.logger.Error("Failed to make connection to TCP destination", "error", err, "type", fmt.Sprintf("%T", err), "cause", c, "causetype", fmt.Sprintf("%T", c))
+		return nil, err
+	}
+
+	file := newMemFile(r.Filepath, false, fs.destination, conn, fs.uploadRate, fs.done, fs.logger)
 	return file.WriterAt()
 }
 
@@ -149,13 +157,13 @@ func (fs *root) Filecmd(r *sftp.Request) error {
 		if err != nil {
 			return err
 		}
-		fs.files[r.Filepath] = newMemFile(r.Filepath, true, fs.destination, fs.uploadRate, fs.done, fs.logger)
+		fs.files[r.Filepath] = newMemFile(r.Filepath, true, fs.destination, nil, fs.uploadRate, fs.done, fs.logger)
 	case "Symlink":
 		_, err := fs.fetch(r.Filepath)
 		if err != nil {
 			return err
 		}
-		link := newMemFile(r.Target, false, fs.destination, fs.uploadRate, fs.done, fs.logger)
+		link := newMemFile(r.Target, false, fs.destination, nil, fs.uploadRate, fs.done, fs.logger)
 		link.symlink = r.Filepath
 		fs.files[r.Target] = link
 	}
@@ -223,34 +231,35 @@ func (fs *root) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 // Implements os.FileInfo, Reader and Writer interfaces.
 // These are the 3 interfaces necessary for the Handlers.
 type memFile struct {
-	name        string
-	modtime     time.Time
-	symlink     string
-	isdir       bool
-	content     []byte
-	conn        net.Conn
-	destination *tcpDestination
-	logger      log15.Logger
-	position    int64
-	maxrate     uint64
-	startTime   time.Time
-	done        <-chan struct{}
-	err         error
+	name      string
+	modtime   time.Time
+	symlink   string
+	isdir     bool
+	content   []byte
+	dest      *tcpDestination
+	conn      net.Conn
+	logger    log15.Logger
+	position  int64
+	maxrate   uint64
+	startTime time.Time
+	done      <-chan struct{}
+	err       error
 	*sync.Mutex
 	*sync.Cond
 }
 
 // factory to make sure modtime is set
-func newMemFile(name string, isdir bool, destination *tcpDestination, maxrate uint64, done <-chan struct{}, logger log15.Logger) *memFile {
+func newMemFile(name string, isdir bool, dest *tcpDestination, conn net.Conn, maxrate uint64, done <-chan struct{}, logger log15.Logger) *memFile {
 	f := &memFile{
-		name:        name,
-		modtime:     time.Now(),
-		isdir:       isdir,
-		logger:      logger,
-		destination: destination,
-		startTime:   time.Now(),
-		maxrate:     maxrate,
-		done:        done,
+		name:      name,
+		modtime:   time.Now(),
+		isdir:     isdir,
+		logger:    logger,
+		startTime: time.Now(),
+		maxrate:   maxrate,
+		dest:      dest,
+		conn:      conn,
+		done:      done,
 	}
 	f.Mutex = &sync.Mutex{}
 	f.Cond = sync.NewCond(f.Mutex)
@@ -291,23 +300,23 @@ func (f *memFile) WriterAt() (io.WriterAt, error) {
 	return f, nil
 }
 func (f *memFile) WriteAt(p []byte, off int64) (int, error) {
-	f.Lock()
-	defer f.Unlock()
-	for f.position != off {
-		f.Wait()
-	}
 	f.logger.Debug("WriteAt", "name", f.name, "length", len(p), "offset", off)
-	if f.err != nil {
-		return 0, f.err
-	}
-	if f.conn == nil {
-		var err error
-		f.conn, err = f.destination.getConn()
-		if err != nil {
-			f.logger.Error("Failed to make connection to TCP destination", "error", err)
-			f.err = err
-			return 0, err
+	f.Lock()
+	defer func() {
+		f.Broadcast()
+		f.Unlock()
+	}()
+	for f.position != off {
+		if f.err != nil {
+			f.logger.Error("Fails because of previous error", "error", f.err, "name", f.name, "offset", off)
+			return 0, f.err
 		}
+		f.Wait()
+		// when Wait() returns the Lock is owned again
+	}
+	if f.err != nil {
+		f.logger.Error("Fails because of previous error", "error", f.err, "name", f.name, "offset", off)
+		return 0, f.err
 	}
 	if f.maxrate > 0 {
 		currentPosition := float64(f.position * 8) // in bits
@@ -327,18 +336,35 @@ func (f *memFile) WriteAt(p []byte, off int64) (int, error) {
 	}
 	n, err := f.conn.Write(p)
 	if err != nil {
-		f.logger.Error("Error happened writing to TCP destination", "error", err)
+		c := cause(err)
+		f.logger.Error("Error happened writing to TCP destination", "error", err, "type", fmt.Sprintf("%T", err), "cause", c, "causetype", fmt.Sprintf("%T", c), "name", f.name, "offset", off)
+		err = c
 		f.err = err
 	}
 	f.position += int64(n)
-	f.Broadcast()
 	return n, err
+}
+
+func cause(err error) error {
+	if err == nil {
+		return nil
+	}
+	if e, ok := err.(*net.OpError); ok {
+		return cause(e.Err)
+	}
+	if e, ok := err.(*os.SyscallError); ok {
+		return cause(e.Err)
+	}
+	return err
 }
 
 func (f *memFile) Close() error {
 	f.Lock()
 	defer f.Unlock()
-	return f.destination.releaseConn(f.conn)
+	if f.conn == nil {
+		return nil
+	}
+	return f.dest.releaseConn(f.conn)
 }
 
 func fakeFileInfoSys() interface{} {

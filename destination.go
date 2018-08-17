@@ -75,13 +75,13 @@ func newDestination(done <-chan struct{}, host string, port int, maxUps uint, lo
 		<-done
 		d.logger.Debug("releaseAllConns")
 		d.Lock()
+		defer d.Unlock()
 		for c := range d.connections {
 			d.logger.Debug("releaseAllConns: release one connection")
 			c.Close()
 			delete(d.connections, c)
 			<-d.uploads
 		}
-		d.Unlock()
 	}()
 	return d, nil
 }
@@ -101,8 +101,8 @@ func (d *tcpDestination) getConn() (net.Conn, error) {
 		return nil, err
 	}
 	d.Lock()
+	defer d.Unlock()
 	d.connections[c] = true
-	d.Unlock()
 	return c, nil
 }
 
@@ -113,11 +113,11 @@ func (d *tcpDestination) releaseConn(c net.Conn) error {
 	}
 	var err error
 	d.Lock()
+	defer d.Unlock()
 	if _, ok := d.connections[c]; ok {
 		err = c.Close()
 		delete(d.connections, c)
 		<-d.uploads
 	}
-	d.Unlock()
 	return err
 }
