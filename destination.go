@@ -6,6 +6,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/inconshreveable/log15"
 )
@@ -54,10 +55,11 @@ type tcpDestination struct {
 	done        <-chan struct{}
 	connections map[net.Conn]bool
 	logger      log15.Logger
+	m           *metrics
 	sync.Mutex
 }
 
-func newDestination(done <-chan struct{}, host string, port int, maxUps uint, logger log15.Logger) (*tcpDestination, error) {
+func newDestination(done <-chan struct{}, host string, port int, maxUps uint, m *metrics, logger log15.Logger) (*tcpDestination, error) {
 	round, err := newRoundRobin(host)
 	if err != nil {
 		return nil, err
@@ -70,6 +72,7 @@ func newDestination(done <-chan struct{}, host string, port int, maxUps uint, lo
 		done:        done,
 		connections: make(map[net.Conn]bool),
 		logger:      logger,
+		m:           m,
 	}
 	go func() {
 		<-done
@@ -93,10 +96,12 @@ func (d *tcpDestination) getConn() (net.Conn, error) {
 		return nil, context.Canceled
 	case d.uploads <- struct{}{}:
 	}
-	hostport := net.JoinHostPort(d.round.next(), fmt.Sprintf("%d", d.port))
+	host := d.round.next()
+	hostport := net.JoinHostPort(host, fmt.Sprintf("%d", d.port))
 	d.logger.Debug("Outgoing connection", "hostport", hostport)
-	c, err := net.Dial("tcp", hostport)
+	c, err := net.DialTimeout("tcp", hostport, 5*time.Second)
 	if err != nil {
+		d.m.nbConnectionsRefused.WithLabelValues(host).Inc()
 		<-d.uploads
 		return nil, err
 	}

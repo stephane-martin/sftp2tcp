@@ -52,6 +52,10 @@
 	name = "github.com/InVisionApp/go-health"
 	version = "1.1.2"
 
+[[constraint]]
+	name = "github.com/storozhukBM/verifier"
+	branch = "master"
+
 [prune]
   go-tests = true
   unused-packages = true

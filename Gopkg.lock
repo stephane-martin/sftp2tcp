@@ -142,6 +142,12 @@
 
 [[projects]]
   branch = "master"
+  name = "github.com/storozhukBM/verifier"
+  packages = ["."]
+  revision = "694d046345c0bd70098b213be5f8e0fa19f9d402"
+
+[[projects]]
+  branch = "master"
   name = "golang.org/x/crypto"
   packages = [
     "curve25519",
@@ -181,6 +187,6 @@
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "2ae33185e14b7990597920ff87f5748e30af1d3a0c69a517fbe773f85f8150f8"
+  inputs-digest = "ec6001e44149ef4ebfb53abf4c6739165a6093cd417f1a94eaa63a7842e46a89"
   solver-name = "gps-cdcl"
   solver-version = 1

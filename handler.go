@@ -21,21 +21,23 @@ import (
 type root struct {
 	*memFile
 	destination *tcpDestination
-	logger      log15.Logger
 	files       map[string]*memFile
 	filesLock   sync.Mutex
 	uploadRate  uint64
 	mockErr     error
 	done        <-chan struct{}
+	logger      log15.Logger
+	m           *metrics
 }
 
-func newRoot(dest *tcpDestination, rate uint64, done <-chan struct{}, l log15.Logger) *root {
+func newRoot(dest *tcpDestination, rate uint64, done <-chan struct{}, m *metrics, l log15.Logger) *root {
 	r := &root{
 		files:       make(map[string]*memFile),
-		memFile:     newMemFile("/", true, dest, nil, rate, done, l),
+		memFile:     newMemFile("/", true, dest, nil, rate, done, nil, l),
 		destination: dest,
 		uploadRate:  rate,
 		done:        done,
+		m:           m,
 		logger:      l,
 	}
 	return r
@@ -58,8 +60,8 @@ func (fs *root) fetch(path string) (*memFile, error) {
 }
 
 // SFTP2TCPHandler returns... TODO
-func SFTP2TCPHandler(dest *tcpDestination, rate uint64, done <-chan struct{}, l log15.Logger) sftp.Handlers {
-	r := newRoot(dest, rate, done, l)
+func SFTP2TCPHandler(dest *tcpDestination, rate uint64, done <-chan struct{}, m *metrics, l log15.Logger) sftp.Handlers {
+	r := newRoot(dest, rate, done, m, l)
 	return sftp.Handlers{
 		FileCmd:  r,
 		FileGet:  r,
@@ -122,7 +124,7 @@ func (fs *root) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 		return nil, err
 	}
 
-	file := newMemFile(r.Filepath, false, fs.destination, conn, fs.uploadRate, fs.done, fs.logger)
+	file := newMemFile(r.Filepath, false, fs.destination, conn, fs.uploadRate, fs.done, fs.m, fs.logger)
 	return file.WriterAt()
 }
 
@@ -157,13 +159,13 @@ func (fs *root) Filecmd(r *sftp.Request) error {
 		if err != nil {
 			return err
 		}
-		fs.files[r.Filepath] = newMemFile(r.Filepath, true, fs.destination, nil, fs.uploadRate, fs.done, fs.logger)
+		fs.files[r.Filepath] = newMemFile(r.Filepath, true, fs.destination, nil, fs.uploadRate, fs.done, nil, fs.logger)
 	case "Symlink":
 		_, err := fs.fetch(r.Filepath)
 		if err != nil {
 			return err
 		}
-		link := newMemFile(r.Target, false, fs.destination, nil, fs.uploadRate, fs.done, fs.logger)
+		link := newMemFile(r.Target, false, fs.destination, nil, fs.uploadRate, fs.done, nil, fs.logger)
 		link.symlink = r.Filepath
 		fs.files[r.Target] = link
 	}
@@ -238,28 +240,30 @@ type memFile struct {
 	content   []byte
 	dest      *tcpDestination
 	conn      net.Conn
-	logger    log15.Logger
 	position  int64
 	maxrate   uint64
 	startTime time.Time
 	done      <-chan struct{}
 	err       error
+	logger    log15.Logger
+	m         *metrics
 	*sync.Mutex
 	*sync.Cond
 }
 
 // factory to make sure modtime is set
-func newMemFile(name string, isdir bool, dest *tcpDestination, conn net.Conn, maxrate uint64, done <-chan struct{}, logger log15.Logger) *memFile {
+func newMemFile(name string, isdir bool, dest *tcpDestination, conn net.Conn, maxrate uint64, done <-chan struct{}, m *metrics, logger log15.Logger) *memFile {
 	f := &memFile{
 		name:      name,
 		modtime:   time.Now(),
 		isdir:     isdir,
-		logger:    logger,
 		startTime: time.Now(),
 		maxrate:   maxrate,
 		dest:      dest,
 		conn:      conn,
 		done:      done,
+		logger:    logger,
+		m:         m,
 	}
 	f.Mutex = &sync.Mutex{}
 	f.Cond = sync.NewCond(f.Mutex)
@@ -334,14 +338,26 @@ func (f *memFile) WriteAt(p []byte, off int64) (int, error) {
 			}
 		}
 	}
+	start := time.Now()
 	n, err := f.conn.Write(p)
-	if err != nil {
+	if err == nil {
+		f.m.uploadRateSummary.Observe(float64(n) / time.Now().Sub(start).Seconds())
+	} else {
 		c := cause(err)
-		f.logger.Error("Error happened writing to TCP destination", "error", err, "type", fmt.Sprintf("%T", err), "cause", c, "causetype", fmt.Sprintf("%T", c), "name", f.name, "offset", off)
+		f.logger.Error("Error happened writing to TCP destination",
+			"error", err,
+			"type", fmt.Sprintf("%T", err),
+			"cause", c,
+			"causetype", fmt.Sprintf("%T", c),
+			"name", f.name,
+			"offset", off,
+		)
 		err = c
 		f.err = err
+		f.m.nbWriteErrors.WithLabelValues(f.conn.RemoteAddr().String()).Inc()
 	}
 	f.position += int64(n)
+	f.m.nbBytesWritten.WithLabelValues(f.conn.RemoteAddr().String()).Add(float64(n))
 	return n, err
 }
 
@@ -363,6 +379,9 @@ func (f *memFile) Close() error {
 	defer f.Unlock()
 	if f.conn == nil {
 		return nil
+	}
+	if f.err == nil {
+		f.m.nbFilesUploaded.WithLabelValues(f.conn.RemoteAddr().String()).Inc()
 	}
 	return f.dest.releaseConn(f.conn)
 }
