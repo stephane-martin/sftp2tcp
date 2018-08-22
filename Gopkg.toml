@@ -44,6 +44,14 @@
     name = "github.com/inconshreveable/log15"
 	branch = "master"
 
+[[constraint]]
+	name = "github.com/prometheus/client_golang"
+	branch = "master"
+
+[[constraint]]
+	name = "github.com/InVisionApp/go-health"
+	version = "1.1.2"
+
 [prune]
   go-tests = true
   unused-packages = true

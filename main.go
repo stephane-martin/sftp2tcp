@@ -10,14 +10,23 @@ import (
 	"io/ioutil"
 	"log/syslog"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
+	health "github.com/InVisionApp/go-health"
+	"github.com/InVisionApp/go-health/checkers"
+	"github.com/InVisionApp/go-health/handlers"
+	inlogger "github.com/InVisionApp/go-logger"
 	"github.com/inconshreveable/log15"
 	homedir "github.com/mitchellh/go-homedir"
 	"github.com/pkg/sftp"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/sync/errgroup"
 	cli "gopkg.in/urfave/cli.v1"
@@ -141,6 +150,12 @@ func makeApp() *cli.App {
 			Usage:  "Maximum upload rate per upload, in megabits/sec (0 for unlimited)",
 			EnvVar: "SFTP2TCP_MAXRATE",
 		},
+		cli.IntFlag{
+			Name:   "httpport",
+			Value:  8080,
+			Usage:  "If positive, sftp2tcp sets up a HTTP service for status information",
+			EnvVar: "SFTP2TCP_HTTPPORT",
+		},
 	}
 
 	app.Commands = []cli.Command{
@@ -190,6 +205,112 @@ func testTCPConnection(c *cli.Context) error {
 	return nil
 }
 
+type metricsKeyType struct{}
+
+var metricsKey metricsKeyType
+
+type metrics struct {
+	nbClientConnections *prometheus.CounterVec
+	registry            *prometheus.Registry
+}
+
+func newMetrics() *metrics {
+	m := new(metrics)
+	m.nbClientConnections = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "client_connections_total",
+			Help: "Number of client connections.",
+		},
+		[]string{"client"},
+	)
+	m.registry = prometheus.NewRegistry()
+	m.registry.MustRegister(m.nbClientConnections)
+	return m
+}
+
+func getMetrics(ctx context.Context) *metrics {
+	return ctx.Value(metricsKey).(*metrics)
+}
+
+type adaptedPromLogger struct {
+	logger log15.Logger
+}
+
+func (a *adaptedPromLogger) Println(v ...interface{}) {
+	a.logger.Error(fmt.Sprintln(v...))
+}
+
+func adaptPromLogger(logger log15.Logger) promhttp.Logger {
+	return &adaptedPromLogger{
+		logger: logger,
+	}
+}
+
+type adaptedInLogger struct {
+	logger log15.Logger
+}
+
+func (a *adaptedInLogger) Debug(msg ...interface{}) {
+	a.logger.Debug(fmt.Sprint(msg...))
+}
+
+func (a *adaptedInLogger) Info(msg ...interface{}) {
+	a.logger.Info(fmt.Sprint(msg...))
+}
+
+func (a *adaptedInLogger) Warn(msg ...interface{}) {
+	a.logger.Warn(fmt.Sprint(msg...))
+}
+
+func (a *adaptedInLogger) Error(msg ...interface{}) {
+	a.logger.Error(fmt.Sprint(msg...))
+}
+
+func (a *adaptedInLogger) Debugln(msg ...interface{}) {
+	a.logger.Debug(fmt.Sprintln(msg...))
+}
+
+func (a *adaptedInLogger) Infoln(msg ...interface{}) {
+	a.logger.Info(fmt.Sprintln(msg...))
+}
+
+func (a *adaptedInLogger) Warnln(msg ...interface{}) {
+	a.logger.Warn(fmt.Sprintln(msg...))
+}
+
+func (a *adaptedInLogger) Errorln(msg ...interface{}) {
+	a.logger.Error(fmt.Sprintln(msg...))
+}
+
+func (a *adaptedInLogger) Debugf(format string, args ...interface{}) {
+	a.logger.Debug(fmt.Sprintf(format, args...))
+}
+
+func (a *adaptedInLogger) Infof(format string, args ...interface{}) {
+	a.logger.Info(fmt.Sprintf(format, args...))
+}
+
+func (a *adaptedInLogger) Warnf(format string, args ...interface{}) {
+	a.logger.Warn(fmt.Sprintf(format, args...))
+}
+
+func (a *adaptedInLogger) Errorf(format string, args ...interface{}) {
+	a.logger.Error(fmt.Sprintf(format, args...))
+}
+
+func (a *adaptedInLogger) WithFields(fields inlogger.Fields) inlogger.Logger {
+	vars := make([]interface{}, 0, 2*len(fields))
+	for k, v := range fields {
+		vars = append(vars, k)
+		vars = append(vars, v)
+	}
+	return adaptInLogger(a.logger.New(vars...))
+}
+
+func adaptInLogger(logger log15.Logger) inlogger.Logger {
+	return &adaptedInLogger{logger}
+}
+
 func proxy(c *cli.Context) (err error) {
 	host := strings.TrimSpace(c.GlobalString("desthost"))
 	port := c.GlobalInt("destport")
@@ -203,6 +324,7 @@ func proxy(c *cli.Context) (err error) {
 	maxUploads := c.GlobalUint("maxuploads")
 	maxInputConns := c.GlobalUint("maxinputconns")
 	rate := c.GlobalUint64("maxuploadrate")
+	httpport := c.GlobalInt("httpport")
 
 	if len(host) == 0 {
 		return exitError("Empty destination host", nil)
@@ -274,17 +396,67 @@ func proxy(c *cli.Context) (err error) {
 	// accepted.
 	listener, err := net.Listen("tcp", listenhostport)
 	if err != nil {
-		return exitError("failed to listen for connection", err)
+		return exitError("failed to create listener", err)
 	}
 	logger.Info("Listening", "address", listener.Addr())
 
 	ctx, cancel := context.WithCancel(context.Background())
-	g, lctx := errgroup.WithContext(ctx)
+	m := newMetrics()
+	g, lctx := errgroup.WithContext(
+		context.WithValue(ctx, metricsKey, m),
+	)
+
+	h := health.New()
+	h.Logger = adaptInLogger(logger)
+	checker, _ := checkers.NewReachableChecker(&checkers.ReachableConfig{
+		URL: &url.URL{
+			Host: net.JoinHostPort(host, fmt.Sprintf("%d", port)),
+		},
+	})
+	h.AddCheck(&health.Config{
+		Name:     "tcp_destination_is_alive",
+		Interval: 5 * time.Second,
+		Checker:  checker,
+	})
+	h.Start()
+
+	muxer := http.NewServeMux()
+	muxer.Handle(
+		"/metrics",
+		promhttp.HandlerFor(
+			m.registry,
+			promhttp.HandlerOpts{
+				DisableCompression:  true,
+				ErrorLog:            adaptPromLogger(logger),
+				ErrorHandling:       promhttp.HTTPErrorOnError,
+				MaxRequestsInFlight: -1,
+				Timeout:             -1,
+			},
+		),
+	)
+	muxer.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	})
+	muxer.Handle(
+		"/healthcheck",
+		handlers.NewJSONHandlerFunc(h, nil),
+	)
+	httpserver := &http.Server{
+		Addr:    net.JoinHostPort(listenaddr, fmt.Sprintf("%d", httpport)),
+		Handler: muxer,
+	}
+	if httpport > 0 {
+		go func() {
+			httpserver.ListenAndServe()
+		}()
+	}
 
 	go func() {
 		// close the listener when the context is canceled
 		// that makes acceptLoop return
 		<-lctx.Done()
+		httpserver.Close()
+		h.Stop()
 		listener.Close()
 	}()
 
@@ -297,31 +469,33 @@ func proxy(c *cli.Context) (err error) {
 		cancel()
 	}()
 
-	acceptLoop(lctx, g, listener, config, host, port, maxInputConns, maxUploads, rate, logger)
+	g.Go(func() error {
+		return acceptLoop(lctx, g, listener, config, host, port, maxInputConns, maxUploads, rate, logger)
+	})
 	_ = g.Wait()
 	return nil
 }
 
-func acceptLoop(ctx context.Context, g *errgroup.Group, listener net.Listener, cfg *ssh.ServerConfig, dhost string, dport int, maxConns uint, maxUps uint, r uint64, l log15.Logger) {
+func acceptLoop(ctx context.Context, g *errgroup.Group, listnr net.Listener, cfg *ssh.ServerConfig, dhost string, port int, maxConns uint, maxUps uint, r uint64, l log15.Logger) error {
 	conns := make(chan struct{}, maxConns)
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return context.Canceled
 		case conns <- struct{}{}:
 		}
-		conn, err := listener.Accept()
+		conn, err := listnr.Accept()
 		if err != nil {
 			l.Debug("Close Accept()", "error", err)
 			<-conns
-			return
+			return err
 		}
 		go func() {
 			<-ctx.Done()
 			conn.Close()
 		}()
 		g.Go(func() error {
-			err := handleConnection(ctx, g, conn, cfg, dhost, dport, maxUps, r, l)
+			err := handleConnection(ctx, g, conn, cfg, dhost, port, maxUps, r, l)
 			if err != nil {
 				l.Warn("Handle connection error", "error", err)
 			}
@@ -332,6 +506,8 @@ func acceptLoop(ctx context.Context, g *errgroup.Group, listener net.Listener, c
 }
 
 func handleConnection(ctx context.Context, g *errgroup.Group, nConn net.Conn, config *ssh.ServerConfig, dhost string, dport int, maxUps uint, r uint64, logger log15.Logger) error {
+	h, _, _ := net.SplitHostPort(nConn.RemoteAddr().String())
+	getMetrics(ctx).nbClientConnections.WithLabelValues(h).Inc()
 	logger.Debug("Handle connection", "remote", nConn.RemoteAddr())
 	lctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -427,21 +603,15 @@ IncomingChannel:
 			}
 			root := SFTP2TCPHandler(dest, r, lctx.Done(), logger)
 			server := sftp.NewRequestServer(channel, root)
-			errServeChan := make(chan error, 2)
 			go func() {
 				// close the server when the context is canceled
 				// makes server.Serve() return
 				<-lctx.Done()
 				logger.Debug("server.Close() called")
 				server.Close()
-				errServeChan <- context.Canceled
 			}()
-			go func() {
-				// TODO: that's only a workaround, there should be a way to make Serve() return cleanly
-				logger.Debug("Serve()")
-				errServeChan <- server.Serve()
-			}()
-			errServe := <-errServeChan
+			logger.Debug("Serve()")
+			errServe := server.Serve()
 			logger.Debug("Serve() returned")
 			if errServe == io.EOF {
 				server.Close()
