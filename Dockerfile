@@ -5,7 +5,7 @@ COPY . ./
 RUN make release
 RUN cp sftp2tcp /
 
-FROM debian:stretch
+FROM debian:stretch-slim
 ENV TZ=Europe/Paris
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 RUN useradd --create-home --shell /bin/bash --home-dir /home/sftp2tcp --user-group --uid 502 sftp2tcp
