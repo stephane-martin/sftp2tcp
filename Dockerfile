@@ -1,5 +1,5 @@
 FROM golang:1.10 AS builder
-MAINTAINER stephane.martin@soprasteria.com
+MAINTAINER stephane.martin_github@vesperal.eu
 WORKDIR $GOPATH/src/github.com/stephane-martin/sftp2tcp
 COPY . ./
 RUN make release

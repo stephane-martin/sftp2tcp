@@ -37,6 +37,10 @@
     branch = "master"
 
 [[constraint]]
+	name = "golang.org/x/net"
+	branch = "master"
+
+[[constraint]]
     name = "golang.org/x/sync"
     branch = "master"
 

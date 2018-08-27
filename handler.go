@@ -340,9 +340,9 @@ func (f *memFile) WriteAt(p []byte, off int64) (int, error) {
 	}
 	start := time.Now()
 	n, err := f.conn.Write(p)
-	if err == nil {
-		f.m.uploadRateSummary.Observe(float64(n) / time.Now().Sub(start).Seconds())
-	} else {
+	f.m.nbBytesWritten.WithLabelValues(f.conn.RemoteAddr().String()).Add(float64(n))
+	f.position += int64(n)
+	if err != nil {
 		c := cause(err)
 		f.logger.Error("Error happened writing to TCP destination",
 			"error", err,
@@ -355,9 +355,9 @@ func (f *memFile) WriteAt(p []byte, off int64) (int, error) {
 		err = c
 		f.err = err
 		f.m.nbWriteErrors.WithLabelValues(f.conn.RemoteAddr().String()).Inc()
+		return n, err
 	}
-	f.position += int64(n)
-	f.m.nbBytesWritten.WithLabelValues(f.conn.RemoteAddr().String()).Add(float64(n))
+	f.m.uploadRateSummary.Observe(float64(n) / time.Now().Sub(start).Seconds())
 	return n, err
 }
 

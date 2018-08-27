@@ -41,3 +41,28 @@ func startHealthChecker(ctx context.Context, g *errgroup.Group, h *health.Health
 	})
 	return nil
 }
+
+// HealthCheckFailed is triggered when a health check fails the first time
+func (sl *HealthCheckStatusListener) HealthCheckFailed(entry *health.State) {
+	sl.m.nbFailedHealthChecks.WithLabelValues(sl.desthost).Inc()
+	sl.logger.Info("failed health check", "name", entry.Name, "nb_failures", entry.ContiguousFailures, "error", entry.Err)
+	if sl.cancel != nil {
+		sl.cancel()
+	}
+}
+
+// HealthCheckRecovered is triggered when a health check recovers
+func (sl *HealthCheckStatusListener) HealthCheckRecovered(entry *health.State, recordedFailures int64, failureDurationSeconds float64) {
+	if entry == nil {
+		sl.logger.Info("Intialize SSH listener")
+	} else {
+		sl.logger.Info(
+			"Recovering from errors",
+			"nb_failures", recordedFailures,
+			"failure_duration", time.Duration(int64(float64(time.Second)*failureDurationSeconds)),
+		)
+	}
+	var ctx context.Context
+	ctx, sl.cancel = context.WithCancel(sl.parentCtx)
+	sl.restart(ctx)
+}

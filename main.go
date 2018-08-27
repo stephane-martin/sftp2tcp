@@ -5,15 +5,12 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log/syslog"
 	"net"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
-	health "github.com/InVisionApp/go-health"
 	"github.com/inconshreveable/log15"
 	homedir "github.com/mitchellh/go-homedir"
 	"github.com/pkg/sftp"
@@ -24,162 +21,6 @@ import (
 )
 
 var Version string
-var GitCommit string
-
-func getLogger(level string, toSyslog bool) log15.Logger {
-	lvl, _ := log15.LvlFromString(level)
-	logger := log15.New()
-	if toSyslog {
-		logger.SetHandler(
-			log15.LvlFilterHandler(
-				lvl,
-				log15.Must.SyslogHandler(
-					syslog.LOG_INFO|syslog.LOG_DAEMON,
-					"sftp2tcp",
-					log15.JsonFormat(),
-				),
-			),
-		)
-	} else {
-		logger.SetHandler(
-			log15.LvlFilterHandler(
-				lvl,
-				log15.StreamHandler(
-					os.Stderr,
-					log15.LogfmtFormat(),
-				),
-			),
-		)
-	}
-	return logger
-}
-
-func makeApp() *cli.App {
-	app := cli.NewApp()
-	app.Name = "sftp2tcp"
-	app.Authors = []cli.Author{
-		cli.Author{
-			Email: "stephane.martin_github@vesperal.eu",
-			Name:  "Stephane Martin",
-		},
-	}
-	app.Copyright = "Apache 2 licence"
-	app.Usage = "Proxy files received by SFTP to a TCP service"
-	app.Version = Version
-
-	app.Flags = []cli.Flag{
-		// TODO: support multiple hosts for round-robin
-		cli.StringFlag{
-			Name:   "desthost, d",
-			Value:  "127.0.0.1",
-			Usage:  "the destination host",
-			EnvVar: "SFTP2TCP_HOST",
-		},
-		cli.IntFlag{
-			Name:   "destport, p",
-			Value:  4444,
-			Usage:  "the destination port",
-			EnvVar: "SFTP2TCP_PORT",
-		},
-		cli.StringFlag{
-			Name:   "listenaddr, l",
-			Value:  "0.0.0.0",
-			Usage:  "the listen address for the SFTP service",
-			EnvVar: "SFTP2TCP_LISTENADDR",
-		},
-		cli.IntFlag{
-			Name:   "listenport, q",
-			Value:  3333,
-			Usage:  "the listen port for the SFTP service",
-			EnvVar: "SFTP2TCP_LISTENPORT",
-		},
-		cli.StringFlag{
-			Name:   "username, u",
-			Value:  "testuser",
-			Usage:  "the username that the SFTP client is expected to use",
-			EnvVar: "SFTP2TCP_USERNAME",
-		},
-		cli.StringFlag{
-			Name:   "password, w",
-			Value:  "testpassword",
-			Usage:  "the password that the SFTP client is expected to use",
-			EnvVar: "SFTP2TCP_PASSWORD",
-		},
-		cli.StringFlag{
-			Name:   "privatekey",
-			Value:  "~/.ssh/id_rsa",
-			Usage:  "the file path for the private RSA key used to setup the SFTP service",
-			EnvVar: "SFTP2TCP_PRIVATEKEY",
-		},
-		cli.BoolFlag{
-			Name:   "syslog",
-			Usage:  "write logs to syslog instead of stderr",
-			EnvVar: "SFTP2TCP_SYSLOG",
-		},
-		cli.StringFlag{
-			Name:   "loglevel",
-			Value:  "info",
-			Usage:  "logging level",
-			EnvVar: "SFTP2TCP_LOGLEVEL",
-		},
-		cli.UintFlag{
-			Name:   "maxinputconns",
-			Value:  12,
-			Usage:  "Maximum number of concurrent input connections",
-			EnvVar: "SFTP2TCP_MAXINPUTCONNS",
-		},
-		cli.UintFlag{
-			Name:   "maxuploads",
-			Value:  1,
-			Usage:  "Maximum number of concurrent file uploads",
-			EnvVar: "SFTP2TCP_MAXUPLOADS",
-		},
-		cli.Uint64Flag{
-			Name:   "maxuploadrate",
-			Value:  0,
-			Usage:  "Maximum upload rate per upload, in megabits/sec (0 for unlimited)",
-			EnvVar: "SFTP2TCP_MAXRATE",
-		},
-		cli.IntFlag{
-			Name:   "httpport",
-			Value:  8080,
-			Usage:  "If positive, sftp2tcp sets up a HTTP service for status information",
-			EnvVar: "SFTP2TCP_HTTPPORT",
-		},
-		cli.BoolFlag{
-			Name:   "nohealthcheck",
-			Usage:  "Do not perform regular health checks about the remote TCP service",
-			EnvVar: "SFTP2TCP_NOHEALTCHECK",
-		},
-	}
-
-	app.Commands = []cli.Command{
-		cli.Command{
-			Name:   "proxy",
-			Usage:  "start listening on SFTP and proxy received files",
-			Action: cli.ActionFunc(proxy),
-		},
-		cli.Command{
-			Name:   "testtcp",
-			Usage:  "test connection to the destination TCP server",
-			Action: cli.ActionFunc(testTCPConnection),
-		},
-	}
-	return app
-}
-
-func exitError(msg string, err error) *cli.ExitError {
-	if len(msg) == 0 && err == nil {
-		return nil
-	}
-	if len(msg) == 0 {
-		return cli.NewExitError(err.Error(), 1)
-	}
-	if err == nil {
-		return cli.NewExitError(msg, 1)
-	}
-	return cli.NewExitError(fmt.Sprintf("%s => %s", msg, err.Error()), 1)
-}
 
 func testTCPConnection(c *cli.Context) error {
 	host := strings.TrimSpace(c.GlobalString("desthost"))
@@ -208,31 +49,6 @@ type HealthCheckStatusListener struct {
 	restart   func(context.Context)
 	desthost  string
 	m         *metrics
-}
-
-// HealthCheckFailed is triggered when a health check fails the first time
-func (sl *HealthCheckStatusListener) HealthCheckFailed(entry *health.State) {
-	sl.m.nbFailedHealthChecks.WithLabelValues(sl.desthost).Inc()
-	sl.logger.Info("failed health check", "name", entry.Name, "nb_failures", entry.ContiguousFailures, "error", entry.Err)
-	if sl.cancel != nil {
-		sl.cancel()
-	}
-}
-
-// HealthCheckRecovered is triggered when a health check recovers
-func (sl *HealthCheckStatusListener) HealthCheckRecovered(entry *health.State, recordedFailures int64, failureDurationSeconds float64) {
-	if entry == nil {
-		sl.logger.Info("Intialize SSH listener")
-	} else {
-		sl.logger.Info(
-			"Recovering from errors",
-			"nb_failures", recordedFailures,
-			"failure_duration", time.Duration(int64(float64(time.Second)*failureDurationSeconds)),
-		)
-	}
-	var ctx context.Context
-	ctx, sl.cancel = context.WithCancel(sl.parentCtx)
-	sl.restart(ctx)
 }
 
 func proxy(c *cli.Context) error {
@@ -302,11 +118,18 @@ func proxy(c *cli.Context) error {
 
 	config.AddHostKey(private)
 
-	ctx, cancel := context.WithCancel(context.Background())
 	m := newMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
 	g, lctx := errgroup.WithContext(
 		context.WithValue(ctx, metricsKey, m),
 	)
+
+	dest, err := newDestination(lctx.Done(), host, port, maxUploads, m, logger)
+	if err != nil {
+		cancel()
+		return fmt.Errorf("Could not setup the destination: %s", err)
+	}
 
 	healthCheckListener := &HealthCheckStatusListener{
 		logger:    logger,
@@ -315,7 +138,7 @@ func proxy(c *cli.Context) error {
 		desthost:  host,
 		restart: func(socketContext context.Context) {
 			g.Go(func() error {
-				err := startListening(lctx, socketContext, g, listenaddr, listenport, host, port, maxInputConns, maxUploads, rate, config, logger)
+				err := startListening(lctx, socketContext, g, dest, listenaddr, listenport, host, port, maxInputConns, maxUploads, rate, config, logger)
 				if err != nil {
 					logger.Error("SSH listening error", "error", err)
 				}
@@ -336,14 +159,14 @@ func proxy(c *cli.Context) error {
 		}
 	}
 
-	startHTTP(lctx, listenaddr, httpport, m, h, logger)
+	stopChan := make(chan os.Signal, 5)
+	signal.Notify(stopChan, syscall.SIGINT, syscall.SIGTERM)
 
-	sigChan := make(chan os.Signal, 5)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	startHTTP(lctx, listenaddr, httpport, dest, m, h, stopChan, logger)
 
 	go func() {
 		// cancel the context when a signal is received
-		<-sigChan
+		<-stopChan
 		cancel()
 	}()
 
@@ -351,13 +174,13 @@ func proxy(c *cli.Context) error {
 	return nil
 }
 
-func startListening(ctx context.Context, socketCtx context.Context, g *errgroup.Group, host string, port int, dhost string, dport int, maxConns uint, maxUps uint, rate uint64, sshCfg *ssh.ServerConfig, l log15.Logger) error {
+func startListening(ctx context.Context, socketCtx context.Context, g *errgroup.Group, dest *tcpDestination, host string, port int, dhost string, dport int, maxConns uint, maxUps uint, rate uint64, sshCfg *ssh.ServerConfig, l log15.Logger) error {
 	listener, err := net.Listen("tcp", net.JoinHostPort(host, fmt.Sprintf("%d", port)))
 	if err != nil {
 		return err
 	}
 	l.Info("Listening for SSH connextions", "address", listener.Addr())
-	err = acceptLoop(ctx, socketCtx, g, listener, sshCfg, dhost, dport, maxConns, maxUps, rate, l)
+	err = acceptLoop(ctx, socketCtx, g, dest, listener, sshCfg, dhost, dport, maxConns, maxUps, rate, l)
 	listener.Close()
 	if err == context.Canceled {
 		return nil
@@ -365,7 +188,7 @@ func startListening(ctx context.Context, socketCtx context.Context, g *errgroup.
 	return err
 }
 
-func acceptLoop(ctx context.Context, socketCtx context.Context, g *errgroup.Group, listnr net.Listener, cfg *ssh.ServerConfig, dhost string, dport int, maxConns uint, maxUps uint, r uint64, l log15.Logger) error {
+func acceptLoop(ctx context.Context, socketCtx context.Context, g *errgroup.Group, dest *tcpDestination, listnr net.Listener, cfg *ssh.ServerConfig, dhost string, dport int, maxConns uint, maxUps uint, r uint64, l log15.Logger) error {
 	conns := make(chan struct{}, maxConns)
 
 	go func() {
@@ -395,7 +218,7 @@ func acceptLoop(ctx context.Context, socketCtx context.Context, g *errgroup.Grou
 			conn.Close()
 		}()
 		g.Go(func() error {
-			err := handleConnection(ctx, g, conn, cfg, dhost, dport, maxUps, r, l)
+			err := handleConnection(ctx, g, dest, conn, cfg, dhost, dport, maxUps, r, l)
 			if err != nil && err != context.Canceled {
 				l.Warn("Handle connection error", "error", err)
 			}
@@ -405,7 +228,7 @@ func acceptLoop(ctx context.Context, socketCtx context.Context, g *errgroup.Grou
 	}
 }
 
-func handleConnection(ctx context.Context, g *errgroup.Group, nConn net.Conn, config *ssh.ServerConfig, dhost string, dport int, maxUps uint, r uint64, logger log15.Logger) error {
+func handleConnection(ctx context.Context, g *errgroup.Group, dest *tcpDestination, nConn net.Conn, config *ssh.ServerConfig, dhost string, dport int, maxUps uint, r uint64, logger log15.Logger) error {
 	h, _, _ := net.SplitHostPort(nConn.RemoteAddr().String())
 	m := getMetrics(ctx)
 	m.nbClientConnections.WithLabelValues(h).Inc()
@@ -491,10 +314,7 @@ IncomingChannel:
 					}
 				}
 			})
-			dest, err := newDestination(lctx.Done(), dhost, dport, maxUps, m, logger)
-			if err != nil {
-				return fmt.Errorf("Could not setup the destination: %s", err)
-			}
+
 			root := SFTP2TCPHandler(dest, r, lctx.Done(), m, logger)
 			server := sftp.NewRequestServer(channel, root)
 			go func() {
