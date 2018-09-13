@@ -84,6 +84,7 @@ func proxy(c *cli.Context) error {
 	if len(loglevel) == 0 {
 		loglevel = "info"
 	}
+	logger := getLogger(loglevel, toSyslog)
 
 	privateKeyPath, err = homedir.Expand(privateKeyPath)
 	if err != nil {
@@ -94,8 +95,6 @@ func proxy(c *cli.Context) error {
 	if err != nil {
 		return exitError("Failed to read the private key", err)
 	}
-
-	logger := getLogger(loglevel, toSyslog)
 
 	// An SSH server is represented by a ServerConfig, which holds
 	// certificate details and handles authentication of ServerConns.

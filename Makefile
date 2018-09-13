@@ -1,6 +1,5 @@
 .POSIX:
 .SUFFIXES:
-.SILENT: vet
 
 SOURCES = $(shell find . -type f -name '*.go' -not -path "./vendor/*")
 
